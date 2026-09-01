@@ -21,6 +21,7 @@ import {
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { createCookieJar } from './cookie-jar'
+import { configureFetch } from './global-fetch'
 import express from 'express'
 import { AddressInfo } from 'net'
 import { Server } from 'http'
@@ -28,8 +29,9 @@ import crypto from 'crypto'
 import fs from 'fs'
 import { readFile, rm } from 'fs/promises'
 import path from 'path'
+import type { ConnectionOptions } from 'tls'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
-import { Agent, EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
+import { Agent, EnvHttpProxyAgent, Headers, RequestInit, setGlobalDispatcher } from 'undici'
 
 // Global type declaration for typescript
 declare global {
@@ -135,7 +137,7 @@ const fetchWithMcpHeaders = (async (url: string | URL, init?: RequestInit) => {
     request = { ...init, headers }
   }
 
-  const response = await fetch(url, request)
+  const response = await globalThis.fetch(url, request as globalThis.RequestInit)
   captureCookies(url, response)
   return response
 }) as unknown as FetchLike
@@ -939,7 +941,7 @@ export async function discoverOAuthServerInfo(
   // Step 1: Probe the MCP server to get WWW-Authenticate header
   try {
     debugLog('Probing MCP server for WWW-Authenticate header')
-    const response = await fetch(serverUrl, {
+    const response = await globalThis.fetch(serverUrl, {
       method: 'GET',
       headers: {
         ...headers,
@@ -1099,7 +1101,7 @@ export async function connectToRemoteServer(
       return Promise.resolve(authProvider?.tokens?.())
         .then((tokens) => {
           const cookie = cookieHeaderFor(requestUrl)
-          return fetch(requestUrl, {
+          return globalThis.fetch(requestUrl, {
             ...init,
             headers: mergeHeaders(
               init?.headers,
@@ -1110,7 +1112,7 @@ export async function connectToRemoteServer(
               tokens?.access_token ? { Authorization: `Bearer ${tokens.access_token}` } : undefined,
               { Accept: 'text/event-stream' },
             ),
-          })
+          } as globalThis.RequestInit)
         })
         .then((response) => {
           captureCookies(requestUrl, response)
@@ -1599,6 +1601,8 @@ type DispatcherOptions = {
   headersTimeout?: number
 }
 
+type TlsOptions = Pick<ConnectionOptions, 'ca' | 'cert' | 'key' | 'passphrase' | 'pfx'>
+
 /**
  * Reads a flag whose value is a duration in seconds, and returns it in milliseconds.
  *
@@ -1677,6 +1681,15 @@ export function parseSecondsOption(args: string[], flag: string, { allowZero = f
   }
 
   return Math.round(seconds * 1000)
+}
+
+function parseStringOption(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag)
+  if (index === -1) return undefined
+  if (index >= args.length - 1 || args[index + 1].startsWith('--')) {
+    throw new Error(`Missing value for ${flag}`)
+  }
+  return args[index + 1]
 }
 
 /** Splits `Name: value` into its parts, or undefined if it is not that shape. */
@@ -1785,16 +1798,46 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   const headersTimeoutMs = parseSecondsOption(args, '--headers-timeout', { allowZero: true })
   const forceIpv4 = args.includes('--ipv4')
 
+  const certPath = parseStringOption(args, '--cert-path')
+  const keyPath = parseStringOption(args, '--key-path')
+  const pfxPath = parseStringOption(args, '--pfx-path')
+  const passphrase = process.env.PASSPHRASE ?? parseStringOption(args, '--passphrase')
+
   const dispatcherOptions: DispatcherOptions = {}
+
+  const connectOptions: DispatcherOptions['connect'] = {}
   if (connectTimeoutMs !== undefined || forceIpv4) {
-    dispatcherOptions.connect = {
-      ...(connectTimeoutMs !== undefined ? { timeout: connectTimeoutMs } : {}),
+    Object.assign(connectOptions, {
+      ...(connectTimeoutMs !== undefined ? { timeout: connectTimeoutMs } : undefined),
       // Happy-eyeballs tries every A and AAAA record it gets back. On a network where the IPv6
       // routes are black holes rather than refusals, those attempts time out instead of failing
       // fast and take the whole request with them, even though the IPv4 addresses are reachable.
-      ...(forceIpv4 ? { family: 4 } : {}),
-    }
+      ...(forceIpv4 ? { family: 4 } : undefined),
+    })
   }
+  if (Object.keys(connectOptions).length > 0) dispatcherOptions.connect = connectOptions
+
+  const tls: TlsOptions = {}
+  const hasPemOption = certPath !== undefined || keyPath !== undefined
+
+  if (pfxPath && hasPemOption) {
+    throw new Error('--pfx-path cannot be combined with --cert-path or --key-path')
+  }
+  if ((certPath && !keyPath) || (!certPath && keyPath)) {
+    throw new Error('--cert-path and --key-path must be provided together')
+  }
+  if (passphrase && !pfxPath && !hasPemOption) {
+    throw new Error('--passphrase requires --pfx-path, or both --cert-path and --key-path')
+  }
+
+  if (pfxPath) {
+    tls.pfx = await readFile(pfxPath)
+  } else if (certPath && keyPath) {
+    tls.cert = await readFile(certPath)
+    tls.key = await readFile(keyPath)
+  }
+  if (passphrase) tls.passphrase = passphrase
+
   if (bodyTimeoutMs !== undefined) dispatcherOptions.bodyTimeout = bodyTimeoutMs
   if (headersTimeoutMs !== undefined) dispatcherOptions.headersTimeout = headersTimeoutMs
 
@@ -1806,13 +1849,23 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   }
 
   const enableProxy = args.includes('--enable-proxy')
+  const hasTlsOptions = Object.keys(tls).length > 0
+  const hasDispatcherOptions = Object.keys(dispatcherOptions).length > 0
+  const portalUrl = process.env.PORTAL_URL
   if (enableProxy) {
     // Use env proxy
-    setGlobalDispatcher(new EnvHttpProxyAgent(dispatcherOptions))
+    setGlobalDispatcher(new EnvHttpProxyAgent({ ...dispatcherOptions, ...(hasTlsOptions ? { requestTls: tls } : {}) }))
     log('HTTP proxy support enabled - using system HTTP_PROXY/HTTPS_PROXY environment variables')
-  } else if (Object.keys(dispatcherOptions).length > 0) {
-    setGlobalDispatcher(new Agent(dispatcherOptions))
+  } else if (hasDispatcherOptions || hasTlsOptions) {
+    setGlobalDispatcher(
+      new Agent({
+        ...dispatcherOptions,
+        ...(Object.keys(connectOptions).length > 0 || hasTlsOptions ? { connect: { ...connectOptions, ...tls } } : {}),
+      }),
+    )
   }
+
+  configureFetch({ useCustomFetch: hasTlsOptions, generatePortalToken: !!portalUrl, portalUrl })
 
   // Keep-alive. `--ping-interval` implies `--keep-alive`, because an interval that silently does
   // nothing unless a second flag is also present is the more surprising reading of the two.
