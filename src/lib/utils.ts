@@ -1838,6 +1838,12 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   }
   if (passphrase) tls.passphrase = passphrase
 
+  const enableCookies = args.includes('--enable-cookies')
+
+  const allowedDomains = parseStringOption(args, '--allowed-domains')
+    ?.split(',')
+    ?.map((domain) => domain.trim())
+
   if (bodyTimeoutMs !== undefined) dispatcherOptions.bodyTimeout = bodyTimeoutMs
   if (headersTimeoutMs !== undefined) dispatcherOptions.headersTimeout = headersTimeoutMs
 
@@ -1851,7 +1857,9 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   const enableProxy = args.includes('--enable-proxy')
   const hasTlsOptions = Object.keys(tls).length > 0
   const hasDispatcherOptions = Object.keys(dispatcherOptions).length > 0
+
   const portalUrl = process.env.PORTAL_URL
+
   if (enableProxy) {
     // Use env proxy
     setGlobalDispatcher(new EnvHttpProxyAgent({ ...dispatcherOptions, ...(hasTlsOptions ? { requestTls: tls } : {}) }))
@@ -1865,7 +1873,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     )
   }
 
-  configureFetch({ useCustomFetch: hasTlsOptions, generatePortalToken: !!portalUrl, portalUrl })
+  configureFetch({ portalUrl, enableCookies, allowedDomains })
 
   // Keep-alive. `--ping-interval` implies `--keep-alive`, because an interval that silently does
   // nothing unless a second flag is also present is the more surprising reading of the two.

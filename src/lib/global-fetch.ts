@@ -8,8 +8,8 @@ import { CookieJar } from 'tough-cookie'
  */
 
 type FetchConfiguration = {
-  useCustomFetch: boolean
-  generatePortalToken: boolean
+  allowedDomains?: string[]
+  enableCookies?: boolean
   portalUrl?: string
 }
 
@@ -17,11 +17,12 @@ type FetchConfiguration = {
 let portal: string = process.env.PORTAL_URL || ''
 let shouldGeneratePortalToken = !!portal
 
+let allowAll = false
+let allowedDomainsSet: Set<string> = new Set()
+
 // Cookie jar to store cookies across requests
 const jar = new CookieJar()
-
-// Domains that have completed cert-based authentication
-const primed = new Set()
+let cookiesEnabled = false
 
 // Effective debouncers for concurrent requests when re-priming cookies or refreshing token.
 let tokenInflight: Promise<any> | null = null
@@ -34,9 +35,12 @@ let token: string | null = null,
 const rawFetch = globalThis.fetch.bind(globalThis)
 let fetchConfigured = false
 
-export function configureFetch({ useCustomFetch, generatePortalToken, portalUrl }: FetchConfiguration): void {
+export function configureFetch({ allowedDomains, portalUrl, enableCookies }: FetchConfiguration): void {
   portal = portalUrl || ''
-  shouldGeneratePortalToken = generatePortalToken && portal.length > 0
+  shouldGeneratePortalToken = portal.length > 0
+  allowAll = !Array.isArray(allowedDomains) || allowedDomains.length === 0 || allowedDomains.includes('*')
+  allowedDomainsSet = new Set(allowedDomains || [])
+  cookiesEnabled = !!enableCookies
 
   if (fetchConfigured) {
     return
@@ -44,22 +48,16 @@ export function configureFetch({ useCustomFetch, generatePortalToken, portalUrl 
 
   fetchConfigured = true
 
-  if (!useCustomFetch) {
+  // No reason to customize fetch
+  if (allowAll && !cookiesEnabled) {
     return
   }
 
-  // Setup global fetch to handle mutual TLS, cookies, and token management
   globalThis.fetch = async (input, init = {}) => {
     const req = new Request(input, init)
     const url = req.url
 
     const headers = new Headers(init.headers)
-
-    // Extract host and check if cookies have been obtained for this host; if not, prime the connection
-    const host = new URL(url).host
-    if (!primed.has(host)) {
-      await prime(new URL(url).origin)
-    }
 
     let res
     const providedToken = headers.get('Authorization')
@@ -67,11 +65,11 @@ export function configureFetch({ useCustomFetch, generatePortalToken, portalUrl 
     // If the request already has an Authorization header, send it as-is
     // This is useful for requests that already include a token or API key
     if (providedToken || !shouldGeneratePortalToken) {
-      res = await send(url, init)
+      res = await request(url, init)
     } else {
       const auth = `Bearer ${await getToken()}`
       headers.set('Authorization', auth)
-      res = await send(url, { ...init, headers })
+      res = await request(url, { ...init, headers })
     }
 
     // 404's just return
@@ -79,19 +77,19 @@ export function configureFetch({ useCustomFetch, generatePortalToken, portalUrl 
       return res
     }
 
-    // If token was generated using the portal and the response is 401, refresh the token and retry
+    // If token was generated using the portal and the response is 401, try refresh the token and retry
     if (res.status === 401 && !providedToken && shouldGeneratePortalToken) {
       await res.body?.cancel()
       await refreshToken()
       const auth = `Bearer ${await getToken()}`
       headers.set('Authorization', auth)
-      res = await send(url, {
+      res = await request(url, {
         ...init,
         headers,
       })
     }
 
-    // NOT else-if, so that if refreshToken above returns stale cookies, we can re-prime and retry the request
+    // NOT else-if, so that if refreshToken still returns evidence of stale cookies, we can re-prime and retry the request
     if (stale(res)) {
       await res.body?.cancel()
       await reprime(url)
@@ -99,12 +97,12 @@ export function configureFetch({ useCustomFetch, generatePortalToken, portalUrl 
       if (!providedToken && shouldGeneratePortalToken) {
         const auth = `Bearer ${await getToken()}`
         headers.set('Authorization', auth)
-        res = await send(url, {
+        res = await request(url, {
           ...init,
           headers,
         })
       } else {
-        res = await send(url, init)
+        res = await request(url, init)
       }
     }
 
@@ -113,47 +111,57 @@ export function configureFetch({ useCustomFetch, generatePortalToken, portalUrl 
   }
 }
 
-async function send(url: string, init: RequestInit = {}) {
-  const headers = new Headers(init.headers)
-  const cookie = await jar.getCookieString(url)
-  if (cookie) {
-    headers.set('cookie', cookie)
+async function request(url: string, init: RequestInit = {}) {
+  const host = new URL(url).host
+  let next = url
+  for (let i = 0; i < 12; i++) {
+    const res = await send(next, { ...init, redirect: 'manual' })
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location')
+      if (!location) return res
+      next = new URL(location, next).toString()
+      continue
+    }
+    return res
   }
+  throw new Error(`redirect loop on ${host}`)
+}
+
+async function send(url: string, init: RequestInit = {}) {
+  if (!allowAll && !isDomainAllowed(new URL(url).host)) {
+    throw new Error(`send to disallowed host: ${new URL(url).host}`)
+  }
+
+  const headers = new Headers(init.headers)
+
+  if (cookiesEnabled) {
+    const cookie = await jar.getCookieString(url)
+    if (cookie) {
+      headers.set('cookie', cookie)
+    }
+  }
+
   const res = await rawFetch(url, {
     ...init,
     redirect: 'manual',
     headers,
   })
-  for (const c of res.headers.getSetCookie?.() ?? []) {
-    await jar.setCookie(c, res.url || url).catch(() => {})
+
+  if (cookiesEnabled) {
+    for (const c of res.headers.getSetCookie?.() ?? []) {
+      await jar.setCookie(c, res.url || url).catch(() => {})
+    }
   }
+
   return res
 }
 
-async function prime(url: string) {
-  const host = new URL(url).host
-  let next = url
-  for (let i = 0; i < 12; i++) {
-    const res = await send(next, { redirect: 'manual' })
-    if (res.status >= 300 && res.status < 400) {
-      const location = res.headers.get('location') || ''
-      next = new URL(location, next).toString()
-      continue
-    }
-    await res.body?.cancel()
-    primed.add(host)
-    return
-  }
-  throw new Error(`prime: redirect loop on ${host}`)
-}
-
 async function getToken() {
-  if (token && Date.now() < tokenExp) return token
-  if (!primed.has(new URL(portal).host)) {
-    await prime(portal)
+  if (token && Date.now() < tokenExp) {
+    return token
   }
 
-  const res = await send(`${portal}/sharing/rest/generateToken`, {
+  const res = await request(`${portal}/sharing/rest/generateToken`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -179,12 +187,12 @@ async function getToken() {
   return token
 }
 
-// Two conditions for a response to be considered stale seen so far.
-// 1. Hosting server returns a redirect to a different domain that actually performs the TLS handshake, and/or
-// 2. It doesn't redirect but returns an HTML page (e.g., a login page) instead of the expected JSON response.
+// Responses that indicate the current authenticated session may no longer be valid.
 function stale(res: Response) {
   const ct = res.headers.get('content-type') || ''
-  return (res.status >= 300 && res.status < 400) || ct.includes('text/html')
+  return (
+    res.status === 401 || res.status === 419 || res.status === 440 || (res.status >= 300 && res.status < 400) || ct.includes('text/html')
+  )
 }
 
 async function refreshToken() {
@@ -206,11 +214,40 @@ async function reprime(url: string) {
   const host = new URL(url).host
   if (!primeInflight.has(host)) {
     const p = (async () => {
-      primed.delete(host)
       token = null // token came from a dead session
-      await prime(new URL(url).origin)
+      await request(new URL(url).origin)
     })().finally(() => primeInflight.delete(host))
     primeInflight.set(host, p)
   }
   return primeInflight.get(host)
+}
+
+function isDomainAllowed(domain: string) {
+  if (allowAll) {
+    return true
+  }
+
+  for (const allowedDomain of allowedDomainsSet) {
+    let cpy = allowedDomain
+    if (allowedDomain.startsWith('*.')) {
+      cpy = cpy.slice(2)
+      if (cpy.includes('*')) {
+        return false
+      }
+      const allowedDomainParts = cpy.split('.')
+      const domainParts = domain.split('.')
+
+      if (domainParts.length != allowedDomainParts.length + 1) {
+        continue
+      }
+
+      if (domainParts.slice(-allowedDomainParts.length).join('.') === cpy) {
+        return true
+      }
+    } else if (domain === cpy) {
+      console.error(`Domain ${domain} matches allowed domain exactly: ${cpy}`)
+      return true
+    }
+  }
+  return false
 }
